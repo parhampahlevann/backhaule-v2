@@ -74,13 +74,14 @@ fi
 if (( mask < 1 || mask > 32 )); then
 return 1
 fi
+if (( mask >= 31 )); then
+# /31 and /32 have no reserved network/broadcast address (RFC 3021) -
+# every address in the block is usable for a point-to-point link.
+return 0
+fi
 local ip_int=$(( (a << 24) | (b << 16) | (c << 8) | d ))
 local mask_int
-if (( mask == 32 )); then
-mask_int=0xFFFFFFFF
-else
 mask_int=$(( (0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF ))
-fi
 local net_int=$(( ip_int & mask_int ))
 local broadcast_int=$(( net_int | (~mask_int & 0xFFFFFFFF) ))
 if (( ip_int == net_int )); then
@@ -95,7 +96,7 @@ install_jq() {
 if ! command -v jq &> /dev/null; then
 if command -v apt-get &> /dev/null; then
 colorize yellow "Installing jq..."
-sudo apt-get update && sudo apt-get install -y jq
+apt-get update -qq && apt-get install -y -qq jq
 else
 colorize red "Error: Unsupported package manager. Please install jq manually."
 press_key
@@ -103,19 +104,42 @@ exit 1
 fi
 fi
 }
+BACKHAUL_CORE_URL="https://github.com/parhampahlevann/backhaule-v2/releases/download/v2.0/backhaul-core.zip"
+
+require_cmd() {
+local cmd="$1"
+local pkg="${2:-$1}"
+if ! command -v "$cmd" &> /dev/null; then
+if command -v apt-get &> /dev/null; then
+colorize yellow "Installing $pkg..."
+apt-get update -qq && apt-get install -y -qq "$pkg"
+else
+colorize red "Error: '$cmd' is missing and apt-get is not available. Install it manually."
+press_key
+return 1
+fi
+fi
+return 0
+}
+
 download_and_extract_backhaul() {
-# --- vendor download removed so the local core can never be overwritten ---
-if [[ -f "${config_dir}/backhaul_core" ]]; then
+if [[ -f "${config_dir}/backhaul_core" && -x "${config_dir}/backhaul_core" ]]; then
 colorize green "Core already installed - keeping it." bold
-chmod u+x "${config_dir}/backhaul_core" 2>/dev/null
 return 0
 fi
 mkdir -p "$config_dir"
 local script_dir
 script_dir="$(cd "$(dirname "$(readlink -f "$0")")" 2>/dev/null && pwd)"
+
+# 1) A binary (or zip) placed next to the script wins first - no network needed.
+#    Useful on the IRAN box if GitHub itself is filtered there.
 local candidates=(
+"${config_dir}/backhaul_core"
+"${config_dir}/backhaul-core"
 "${config_dir}/backhaul-v2"
+"${script_dir}/backhaul-core"
 "${script_dir}/backhaul-v2"
+"/root/backhaul-core"
 "/root/backhaul-v2"
 "/usr/local/bin/backhaul-v2"
 )
@@ -123,15 +147,89 @@ local src_core=""
 for c in "${candidates[@]}"; do
 if [[ -n "$c" && -f "$c" ]]; then src_core="$c"; break; fi
 done
-if [[ -z "$src_core" ]]; then
-colorize red "Core binary not found." bold
-colorize yellow "Put 'backhaul-v2' next to this script (or in ${config_dir}) and re-run."
+local local_zip=""
+for z in "${config_dir}/backhaul-core.zip" "${script_dir}/backhaul-core.zip"; do
+[[ -f "$z" ]] && local_zip="$z" && break
+done
+
+if [[ -n "$src_core" ]]; then
+cp -f "$src_core" "${config_dir}/backhaul_core"
+chmod +x "${config_dir}/backhaul_core"
+colorize green "✔ Core installed from local file: $src_core" bold
+return 0
+fi
+
+require_cmd unzip unzip || return 1
+local tmp_dir
+tmp_dir=$(mktemp -d)
+
+if [[ -n "$local_zip" ]]; then
+colorize yellow "Found a local archive ($local_zip) - extracting it instead of downloading."
+cp -f "$local_zip" "${tmp_dir}/backhaul-core.zip"
+else
+require_cmd curl curl || { rm -rf "$tmp_dir"; return 1; }
+colorize yellow "Downloading Backhaul core from GitHub release..."
+if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 10 -o "${tmp_dir}/backhaul-core.zip" "$BACKHAUL_CORE_URL"; then
+colorize red "Download failed (GitHub may be blocked/filtered on this server)." bold
+echo "URL: $BACKHAUL_CORE_URL"
+colorize yellow "Workarounds:"
+echo "  1) On a machine with access, download that URL and 'scp' the file to:"
+echo "       ${script_dir}/backhaul-core.zip"
+echo "     then re-run this script - it will be picked up automatically."
+echo "  2) Or retry through a proxy, e.g.:"
+echo "       HTTPS_PROXY=socks5h://127.0.0.1:1080 bash $0"
+rm -rf "$tmp_dir"
 press_key
 return 1
 fi
-cp -f "$src_core" "${config_dir}/backhaul_core"
-chmod u+x "${config_dir}/backhaul_core"
-colorize green "Core installed." bold
+fi
+
+if ! unzip -oq "${tmp_dir}/backhaul-core.zip" -d "$tmp_dir"; then
+colorize red "Failed to extract the archive (corrupted/incomplete download)." bold
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
+
+# Pick the right binary out of the archive: prefer a filename matching this
+# host's CPU architecture, then fall back to "the only executable", then
+# "the largest file" (binaries are almost always the biggest thing in the zip).
+local arch arch_pattern candidate=""
+arch=$(uname -m)
+case "$arch" in
+x86_64|amd64) arch_pattern="amd64|x86_64" ;;
+aarch64|arm64) arch_pattern="arm64|aarch64" ;;
+*) arch_pattern="$arch" ;;
+esac
+candidate=$(find "$tmp_dir" -type f -executable ! -name "*.zip" | grep -Ei "$arch_pattern" | head -n1)
+if [[ -z "$candidate" ]]; then
+local exe_list
+exe_list=$(find "$tmp_dir" -type f -executable ! -name "*.zip")
+[[ $(grep -c . <<< "$exe_list") -eq 1 ]] && candidate="$exe_list"
+fi
+if [[ -z "$candidate" ]]; then
+candidate=$(find "$tmp_dir" -type f ! -name "*.zip" ! -iname "*.txt" ! -iname "*.md" ! -iname "license*" -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
+fi
+
+if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+colorize red "Could not identify the core binary inside the archive." bold
+colorize yellow "Files found:"
+find "$tmp_dir" -type f ! -name "*.zip"
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
+
+cp -f "$candidate" "${config_dir}/backhaul_core"
+chmod +x "${config_dir}/backhaul_core"
+rm -rf "$tmp_dir"
+
+if "${config_dir}/backhaul_core" -v &>/dev/null || "${config_dir}/backhaul_core" --version &>/dev/null; then
+colorize green "✔ Core downloaded and installed successfully." bold
+else
+colorize yellow "⚠ Core installed, but it didn't respond cleanly to -v. Verify manually: ${config_dir}/backhaul_core -v" bold
+fi
+return 0
 }
 install_jq
 download_and_extract_backhaul
@@ -211,7 +309,7 @@ prompt_transport_section() {
 local mode="$1"
 local is_ipx="false"
 colorize blue "━━━ Transport Configuration ━━━" bold
-local valid_transports=(tcp tcpmux xtcpmux ws wss wsmux wssmux xwsmux anytls tun)
+local valid_transports=(tcp tcpmux xtcpmux mtcp ws wss wsmux wssmux xwsmux anytls tun)
 echo "Available transports:"
 printf '  • %s\n' "${valid_transports[@]}"
 while true; do
@@ -240,7 +338,7 @@ if [[ "$is_ipx" != "true" ]]; then
 prompt_boolean "Enable TCP_NODELAY" "true" CONFIG[nodelay]
 fi
 if [[ "$mode" == "server" ]]; then
-if [[ "${CONFIG[transport_type]}" == "tcp" ]]; then
+if [[ "${CONFIG[transport_type]}" == "tcp" || "${CONFIG[transport_type]}" == "mtcp" ]]; then
 prompt_boolean "Accept UDP over TCP" "false" CONFIG[accept_udp]
 fi
 if [[ ! "${CONFIG[transport_type]}" =~ ^(tun|ws)$ ]] && [[ "$is_ipx" != "true" ]]; then
@@ -251,10 +349,13 @@ if [[ "${CONFIG[transport_type]}" != "tun" ]]; then
 prompt_with_default "Connection Pool" "8" CONFIG[connection_pool]
 fi
 fi
-CONFIG[heartbeat_interval]="10"
-CONFIG[heartbeat_timeout]="25"
+# More frequent heartbeats + a more tolerant timeout, and a shorter TCP
+# keepalive period, survive NAT/firewall idle-drops and latency spikes
+# better than the previous defaults (10/25/40) without being chatty.
+CONFIG[heartbeat_interval]="8"
+CONFIG[heartbeat_timeout]="45"
 if [[ "$is_ipx" != "true" ]]; then
-CONFIG[keepalive_period]="40"
+CONFIG[keepalive_period]="20"
 fi
 echo ""
 }
@@ -291,8 +392,7 @@ prompt_with_default "TUN Local Address (CIDR)" "$default_local" CONFIG[tun_local
 if validate_cidr "${CONFIG[tun_local_addr]}"; then
 break
 fi
-local suggested=$(validate_cidr "${CONFIG[tun_local_addr]}" 2>&1)
-colorize red "Invalid CIDR. Network address should be: $suggested"
+colorize red "Invalid CIDR. Use format like 10.10.10.1/24 (host bits set, not the network/broadcast address)."
 done
 while true; do
 prompt_with_default "TUN Remote Address (CIDR)" "$default_remote" CONFIG[tun_remote_addr]
@@ -318,13 +418,17 @@ fi
 colorize blue "━━━ TLS Configuration ━━━" bold
 if [[ "$transport" == "anytls" ]]; then
 prompt_with_default "SNI" "www.digikala.com" CONFIG[tls_sni]
+elif [[ "$transport" == "wss" || "$transport" == "wssmux" ]]; then
+# This MUST match the server certificate's CN below, on both sides, or the
+# TLS handshake fails - a very common cause of "connects then drops" wss tunnels.
+prompt_with_default "SNI (must match server cert CN)" "backhaul.com" CONFIG[tls_sni]
 fi
 if [[ "$mode" == "client" ]]; then
 echo
 return
 fi
 if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
-colorize red "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
+colorize red "[*] TLS certificate or key missing, generating self-signed EC (P-256) cert..."
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$KEY_FILE" -out  "$CERT_FILE" -subj "/CN=backhaul.com"
 colorize green "[*] Generated $CERT_FILE and $KEY_FILE"
 echo
@@ -395,7 +499,7 @@ read -r CONFIG[ports_mapping]
 echo ""
 else
 colorize blue "━━━ Port Mapping Configuration (tun helper) ━━━" bold
-colorize magenta "Forwarder: use 'bbackhaul' for TCP support only, or 'iptables' for TCP + UDP support"
+colorize magenta "Forwarder: use 'backhaul' for TCP support only, or 'iptables' for TCP + UDP support"
 prompt_with_default "Forwarder (backhaul/iptables)" "backhaul" CONFIG[forwarder]
 echo ""
 colorize green "Supported formats:"
@@ -610,6 +714,14 @@ create_systemd_service "$service_type" "$tunnel_port" "$config_file"
 echo ""
 colorize green "✔ Configuration completed successfully!" bold
 echo ""
+colorize yellow "━━━ These MUST be identical on the Iran server AND the Kharej client ━━━" bold
+echo "  Transport type : ${CONFIG[transport_type]}"
+[[ -n "${CONFIG[token]}" ]] && echo "  Security token  : ${CONFIG[token]}"
+[[ -n "${CONFIG[psk]}" ]] && echo "  PSK             : ${CONFIG[psk]}"
+[[ -n "${CONFIG[algorithm]}" ]] && echo "  Algorithm       : ${CONFIG[algorithm]}"
+[[ -n "${CONFIG[tls_sni]}" ]] && echo "  TLS SNI         : ${CONFIG[tls_sni]}"
+colorize yellow "A single mismatch in any of the above is the most common reason a tunnel connects then endlessly drops/restarts." bold
+echo ""
 press_key
 }
 create_systemd_service() {
@@ -621,7 +733,8 @@ local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
 cat > "$service_file" <<EOF
 [Unit]
 Description=Backhaul $desc_type Port $port
-After=network.target
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
 User=root
@@ -638,11 +751,21 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now "backhaul-${type}${port}.service" >/dev/null 2>&1
-colorize green "✔ Service backhaul-${type}${port} created and started" bold
+sleep 2
+if systemctl is-active --quiet "backhaul-${type}${port}.service"; then
+colorize green "✔ Service backhaul-${type}${port} created and running" bold
+else
+colorize red "✘ Service backhaul-${type}${port} was created but is NOT running." bold
+colorize yellow "Last log lines:"
+journalctl -u "backhaul-${type}${port}.service" -n 15 --no-pager
+fi
 }
 SERVER_IP=$(hostname -I | awk '{print $1}')
-SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country')
-SERVER_ISP=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.isp')
+SERVER_GEO_JSON=$(curl -sS --max-time 4 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null)
+SERVER_COUNTRY=$(jq -r '.country // "Unknown"' <<< "$SERVER_GEO_JSON" 2>/dev/null)
+SERVER_ISP=$(jq -r '.isp // "Unknown"' <<< "$SERVER_GEO_JSON" 2>/dev/null)
+[[ -z "$SERVER_COUNTRY" || "$SERVER_COUNTRY" == "null" ]] && SERVER_COUNTRY="Unknown"
+[[ -z "$SERVER_ISP" || "$SERVER_ISP" == "null" ]] && SERVER_ISP="Unknown"
 display_logo() {
 echo -e "\033[36m"
 cat << "EOF"
@@ -706,7 +829,8 @@ desc_loc="$(tr '[:lower:]' '[:upper:]' <<< "${location:0:1}")${location:1}"
 cat > "$service_file" <<EOF
 [Unit]
 Description=Backhaul $desc_loc Port $tunnel_port
-After=network.target
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
 User=root
@@ -721,9 +845,14 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now "$(basename "$service_file")"
-echo "Created and started $(basename "$service_file")"
+systemctl daemon-reload
+systemctl enable --now "$(basename "$service_file")" >/dev/null 2>&1
+sleep 2
+if systemctl is-active --quiet "$(basename "$service_file")"; then
+colorize green "✔ $(basename "$service_file") running" bold
+else
+colorize red "✘ $(basename "$service_file") created but not running - check: journalctl -u $(basename "$service_file")" bold
+fi
 done
 fi
 sleep 2
